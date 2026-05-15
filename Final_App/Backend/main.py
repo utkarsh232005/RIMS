@@ -13,8 +13,8 @@ load_dotenv()
 
 app = FastAPI(
     title="AI RAG API",
-    description="FastAPI application for AI responses and RAG using Hugging Face Inference API",
-    version="1.0.0"
+    description="FastAPI application for AI responses and RAG using Multi-Model LLM (Gemini + OpenAI)",
+    version="2.0.0"
 )
 
 # ---------------------------------------------------------------------------
@@ -40,7 +40,6 @@ app.add_middleware(
 # Initialize handlers. RAG is loaded lazily because the dashboard does not need
 # embeddings, and first-time model loading may require network access.
 rag_handler: RAGHandler | None = None
-hf_model_id = os.getenv("HF_MODEL_ID", "deepseek-ai/DeepSeek-V4-Pro")
 ai_handler: AIHandler | None = None
 
 
@@ -54,7 +53,7 @@ def get_rag_handler() -> RAGHandler:
 def get_ai_handler() -> AIHandler:
     global ai_handler
     if ai_handler is None:
-        ai_handler = AIHandler(model=hf_model_id)  # Uses fallback if API setup fails.
+        ai_handler = AIHandler()  # Multi-model: Gemini (primary) + OpenAI (fallback)
     return ai_handler
 
 # Models

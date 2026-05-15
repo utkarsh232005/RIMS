@@ -103,9 +103,10 @@ modules = [
     "uvicorn",
     "dotenv",
     "databricks.sql",
-    "chromadb",
+    "pinecone",
     "sentence_transformers",
-    "huggingface_hub",
+    "google.genai",
+    "openai",
 ]
 for module in modules:
     __import__(module)

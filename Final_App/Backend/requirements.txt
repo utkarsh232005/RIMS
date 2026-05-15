@@ -4,9 +4,9 @@ pydantic>=2.7.0
 python-multipart==0.0.6
 langchain==0.1.13
 langchain-community==0.0.29
-langchain-huggingface==0.0.1
-huggingface-hub>=0.23.0
-chromadb==0.5.0
+google-genai>=2.3.0
+openai>=1.40.0
+pinecone>=5.0.0
 posthog<3.0.0
 sentence-transformers>=2.6.0
 python-dotenv==1.0.0
