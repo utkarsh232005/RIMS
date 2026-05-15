@@ -21,15 +21,15 @@ def _table(env_name: str, default_name: str) -> str:
 
 
 def _sales_table() -> str:
-    return _table("DATABRICKS_GOLD_SALES_TABLE", "gold_all_features_combined")
+    return _table("DATABRICKS_GOLD_SALES_TABLE", "gold_sales_ml_clean")
 
 
 def _inventory_table() -> str:
-    return _table("DATABRICKS_GOLD_INVENTORY_TABLE", "gold_all_features_combined")
+    return _table("DATABRICKS_GOLD_INVENTORY_TABLE", "gold_inventory_features")
 
 
 def _delivery_table() -> str:
-    return _table("DATABRICKS_GOLD_DELIVERY_TABLE", "gold_all_features_combined")
+    return _table("DATABRICKS_GOLD_DELIVERY_TABLE", "gold_delivery_features")
 
 
 def _query(statement: str, cache_key: str) -> list[dict[str, Any]]:
@@ -65,14 +65,14 @@ def _clamp(value: float, low: float = 0.0, high: float = 100.0) -> float:
     return max(low, min(high, value))
 
 
-def _status_from_stock(stock: float, inv_reorder_point: float) -> str:
-    if inv_reorder_point <= 0:
+def _status_from_stock(stock: float, reorder_point: float) -> str:
+    if reorder_point <= 0:
         return "Healthy"
-    if stock < inv_reorder_point * 0.8:
+    if stock < reorder_point * 0.8:
         return "Critical"
-    if stock < inv_reorder_point:
+    if stock < reorder_point:
         return "Low"
-    if stock > inv_reorder_point * 2:
+    if stock > reorder_point * 2:
         return "Overstock"
     return "Healthy"
 
@@ -103,7 +103,7 @@ def build_kpi_metrics() -> list[dict[str, Any]]:
             inventory_metrics AS (
               SELECT
                 SUM(CASE WHEN COALESCE(stock_below_reorder, 0) = 1 THEN 1 ELSE 0 END) AS reorder_alerts,
-                SUM(COALESCE(store_sales, 0)) / NULLIF(AVG(NULLIF(inv_current_stock, 0)), 0) AS inventory_turns,
+                SUM(COALESCE(store_sales, 0)) / NULLIF(AVG(NULLIF(current_stock, 0)), 0) AS inventory_turns,
                 100 - LEAST(
                   100,
                   AVG(
@@ -245,7 +245,7 @@ def build_ai_insights() -> list[dict[str, Any]]:
             inventory AS (
               SELECT
                 SUM(CASE WHEN COALESCE(stock_below_reorder, 0) = 1 THEN 1 ELSE 0 END) AS below_reorder,
-                SUM(CASE WHEN inv_reorder_point > 0 AND inv_current_stock > inv_reorder_point * 2 THEN 1 ELSE 0 END) AS overstocked
+                SUM(CASE WHEN reorder_point > 0 AND current_stock > reorder_point * 2 THEN 1 ELSE 0 END) AS overstocked
               FROM {inventory}
             ),
             supplier AS (
@@ -322,10 +322,10 @@ def build_autonomous_decisions() -> list[dict[str, Any]]:
     inventory = _inventory_table()
     rows = _query(
         f"""
-        SELECT product_id, store_id, inv_current_stock, inv_reorder_point, days_inventory_outstanding
+        SELECT product_id, store_id, current_stock, reorder_point, days_inventory_outstanding
         FROM {inventory}
         WHERE COALESCE(stock_below_reorder, 0) = 1
-        ORDER BY inv_current_stock ASC, inv_reorder_point DESC
+        ORDER BY current_stock ASC, reorder_point DESC
         LIMIT 4
         """,
         "autonomous-decisions",
@@ -335,8 +335,8 @@ def build_autonomous_decisions() -> list[dict[str, Any]]:
             "id": f"d{index + 1}",
             "title": f"Review replenishment for {row.get('product_id') or 'product'}",
             "description": (
-                f"{row.get('store_id') or 'Store'} has {_int(row.get('inv_current_stock')):,} units "
-                f"against a reorder point of {_int(row.get('inv_reorder_point')):,}."
+                f"{row.get('store_id') or 'Store'} has {_int(row.get('current_stock')):,} units "
+                f"against a reorder point of {_int(row.get('reorder_point')):,}."
             ),
             "confidence": 90,
             "status": "review",
@@ -364,8 +364,8 @@ def build_warehouse_utilization() -> list[dict[str, Any]]:
         f"""
         SELECT
           store_id,
-          SUM(COALESCE(inv_current_stock, 0)) AS stock,
-          SUM(COALESCE(inv_current_stock, 0) + COALESCE(inv_reorder_point, 0)) AS capacity_proxy
+          SUM(COALESCE(current_stock, 0)) AS stock,
+          SUM(COALESCE(current_stock, 0) + COALESCE(reorder_point, 0)) AS capacity_proxy
         FROM {inventory}
         GROUP BY store_id
         ORDER BY stock DESC
@@ -515,13 +515,13 @@ def build_demand_intelligence() -> dict[str, Any]:
         f"""
         WITH weekly AS (
           SELECT
-            date_trunc('week', inventory_date) AS week_start,
+            date_trunc('week', date) AS week_start,
             SUM(COALESCE(store_sales, 0)) AS actual,
             SUM(COALESCE(avg_sales_30d, 0)) AS forecast,
             SUM(COALESCE(stddev_sales_30d, 0)) AS uncertainty
           FROM {inventory}
-          WHERE inventory_date IS NOT NULL
-          GROUP BY date_trunc('week', inventory_date)
+          WHERE date IS NOT NULL
+          GROUP BY date_trunc('week', date)
           ORDER BY week_start DESC
           LIMIT 10
         )
@@ -636,15 +636,15 @@ def build_inventory_history() -> list[dict[str, Any]]:
         f"""
         WITH inventory_status AS (
           SELECT
-            date_trunc('month', inventory_date) AS month_start,
+            date_trunc('month', date) AS month_start,
             CASE
-              WHEN inv_reorder_point > 0 AND inv_current_stock < inv_reorder_point * 0.8 THEN 'critical'
-              WHEN inv_reorder_point > 0 AND inv_current_stock < inv_reorder_point THEN 'low'
-              WHEN inv_reorder_point > 0 AND inv_current_stock > inv_reorder_point * 2 THEN 'overstock'
+              WHEN reorder_point > 0 AND current_stock < reorder_point * 0.8 THEN 'critical'
+              WHEN reorder_point > 0 AND current_stock < reorder_point THEN 'low'
+              WHEN reorder_point > 0 AND current_stock > reorder_point * 2 THEN 'overstock'
               ELSE 'healthy'
             END AS status
           FROM {inventory}
-          WHERE inventory_date IS NOT NULL
+          WHERE date IS NOT NULL
         ),
         monthly AS (
           SELECT
@@ -686,10 +686,10 @@ def build_inventory() -> dict[str, Any]:
           SELECT
             product_id,
             store_id,
-            inv_current_stock,
-            inv_reorder_point,
+            current_stock,
+            reorder_point,
             days_inventory_outstanding,
-            ROW_NUMBER() OVER (PARTITION BY product_id, store_id ORDER BY inventory_date DESC) AS rn
+            ROW_NUMBER() OVER (PARTITION BY product_id, store_id ORDER BY date DESC) AS rn
           FROM {inventory}
         ),
         product_meta AS (
@@ -702,8 +702,8 @@ def build_inventory() -> dict[str, Any]:
         SELECT
           inv.product_id,
           inv.store_id,
-          inv.inv_current_stock,
-          inv.inv_reorder_point,
+          inv.current_stock,
+          inv.reorder_point,
           inv.days_inventory_outstanding,
           meta.category
         FROM latest_inventory inv
@@ -711,16 +711,16 @@ def build_inventory() -> dict[str, Any]:
           ON CAST(inv.product_id AS STRING) = CAST(meta.product_id AS STRING)
         WHERE inv.rn = 1
         ORDER BY
-          CASE WHEN inv.inv_reorder_point > 0 AND inv.inv_current_stock < inv.inv_reorder_point THEN 0 ELSE 1 END,
-          inv.inv_current_stock ASC
+          CASE WHEN inv.reorder_point > 0 AND inv.current_stock < inv.reorder_point THEN 0 ELSE 1 END,
+          inv.current_stock ASC
         LIMIT 200
         """,
         "inventory-items",
     )
     items = []
     for row in rows:
-        stock = _num(row.get("inv_current_stock"))
-        inv_reorder_point = _num(row.get("inv_reorder_point"))
+        stock = _num(row.get("current_stock"))
+        reorder_point = _num(row.get("reorder_point"))
         sku = str(row.get("product_id") or "unknown")
         items.append(
             {
@@ -729,8 +729,8 @@ def build_inventory() -> dict[str, Any]:
                 "category": row.get("category") or "General",
                 "warehouse": str(row.get("store_id") or "Store"),
                 "stock": _int(stock),
-                "reorderPoint": _int(inv_reorder_point),
-                "status": _status_from_stock(stock, inv_reorder_point),
+                "reorderPoint": _int(reorder_point),
+                "status": _status_from_stock(stock, reorder_point),
                 "daysOfCover": _int(row.get("days_inventory_outstanding")),
             }
         )
@@ -846,7 +846,7 @@ def build_regional_performance() -> dict[str, Any]:
               SELECT
                 AVG(CASE WHEN COALESCE(stock_below_reorder, 0) = 1 THEN 1.0 ELSE 0.0 END) * 100 AS stockout_probability,
                 AVG(ABS(COALESCE(stddev_sales_30d, 0)) / NULLIF(ABS(avg_sales_30d), 0)) * 100 AS demand_volatility,
-                AVG(CASE WHEN inv_reorder_point > 0 AND inv_current_stock > inv_reorder_point * 2 THEN 1.0 ELSE 0.0 END) * 100 AS overstock_probability
+                AVG(CASE WHEN reorder_point > 0 AND current_stock > reorder_point * 2 THEN 1.0 ELSE 0.0 END) * 100 AS overstock_probability
               FROM {inventory}
             ),
             supplier AS (
