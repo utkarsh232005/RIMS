@@ -11,7 +11,7 @@ import { TrendingUp, Zap } from "lucide-react";
 export const Route = createFileRoute("/forecasting")({
   head: () => ({
     meta: [
-      { title: "Forecasting · Nexus SCM" },
+      { title: "Forecasting · RIMS" },
       { name: "description", content: "Demand projections, AI confidence, and what-if scenarios." },
     ],
   }),

@@ -12,7 +12,7 @@ import { AlertTriangle, Boxes } from "lucide-react";
 export const Route = createFileRoute("/inventory")({
   head: () => ({
     meta: [
-      { title: "Inventory · Nexus SCM" },
+      { title: "Inventory · RIMS" },
       { name: "description", content: "Stock levels, reorder signals, and warehouse utilization." },
     ],
   }),

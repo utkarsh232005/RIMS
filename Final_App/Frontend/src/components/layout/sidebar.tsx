@@ -55,7 +55,7 @@ export function Sidebar() {
           <Activity className="h-4 w-4" strokeWidth={2.25} />
         </div>
         <div className="leading-tight">
-          <p className="text-sm font-semibold text-sidebar-foreground">Nexus SCM</p>
+          <p className="text-sm font-semibold text-sidebar-foreground">RIMS</p>
           <p className="text-[11px] text-muted-foreground">Supply chain control</p>
         </div>
       </div>
