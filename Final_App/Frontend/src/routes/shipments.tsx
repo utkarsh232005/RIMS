@@ -11,7 +11,7 @@ import { Truck, Clock, AlertTriangle, CheckCircle2 } from "lucide-react";
 export const Route = createFileRoute("/shipments")({
   head: () => ({
     meta: [
-      { title: "Shipments · Nexus SCM" },
+      { title: "Shipments · RIMS" },
       {
         name: "description",
         content: "Live shipment tracking, ETA predictions, and route intelligence.",

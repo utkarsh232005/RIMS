@@ -15,7 +15,7 @@ import { EmptyBlock, ErrorBlock, LoadingBlock } from "@/components/common/data-s
 export const Route = createFileRoute("/")({
   head: () => ({
     meta: [
-      { title: "Operations Overview · Nexus SCM" },
+      { title: "Operations Overview · RIMS" },
       {
         name: "description",
         content: "Live overview of shipments, demand, and autonomous decisions.",

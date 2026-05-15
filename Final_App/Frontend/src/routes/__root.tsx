@@ -72,7 +72,7 @@ export const Route = createRootRouteWithContext<{ queryClient: QueryClient }>()(
     meta: [
       { charSet: "utf-8" },
       { name: "viewport", content: "width=device-width, initial-scale=1" },
-      { title: "Nexus SCM — Autonomous Supply Chain Platform" },
+      { title: "RIMS — Autonomous Supply Chain Platform" },
       {
         name: "description",
         content:

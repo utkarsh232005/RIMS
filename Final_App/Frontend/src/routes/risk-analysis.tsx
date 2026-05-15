@@ -20,7 +20,7 @@ import {
 export const Route = createFileRoute("/risk-analysis")({
   head: () => ({
     meta: [
-      { title: "Risk Analysis · Nexus SCM" },
+      { title: "Risk Analysis · RIMS" },
       {
         name: "description",
         content: "Supplier risk scoring, anomaly detection, and predictive risk analytics.",

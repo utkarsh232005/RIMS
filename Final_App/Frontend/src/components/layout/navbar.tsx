@@ -54,7 +54,7 @@ export function Navbar() {
           className="w-[min(100%,20rem)] border-r border-border p-0 sm:max-w-xs"
         >
           <SheetHeader className="border-b border-border px-5 py-4 text-left">
-            <SheetTitle className="text-base font-semibold">Nexus SCM</SheetTitle>
+            <SheetTitle className="text-base font-semibold">RIMS</SheetTitle>
           </SheetHeader>
           <div className="px-3 py-4">
             <SidebarNavLinks onNavigate={() => setMobileOpen(false)} />
