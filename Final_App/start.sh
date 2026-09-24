@@ -27,6 +27,31 @@ BACKEND_STATUS_URL="$BACKEND_URL/api/databricks-status"
 BACKEND_VENV_DIR="$BACKEND_DIR/.venv"
 ML_VENV_DIR="$ML_DIR/.venv"
 
+venv_python_bin() {
+  local venv_dir="$1"
+  if [ -x "$venv_dir/bin/python" ]; then
+    echo "$venv_dir/bin/python"
+    return 0
+  fi
+
+  if [ -x "$venv_dir/bin/python3" ]; then
+    echo "$venv_dir/bin/python3"
+    return 0
+  fi
+
+  if [ -x "$venv_dir/Scripts/python.exe" ]; then
+    echo "$venv_dir/Scripts/python.exe"
+    return 0
+  fi
+
+  if [ -x "$venv_dir/Scripts/python" ]; then
+    echo "$venv_dir/Scripts/python"
+    return 0
+  fi
+
+  return 1
+}
+
 # Track child PIDs so we can clean up on exit
 BACKEND_PID=""
 FRONTEND_PID=""
@@ -260,17 +285,18 @@ free_port() {
 require_backend_env
 ensure_ollama_and_models
 SYSTEM_PYTHON_BIN="$(choose_python)"
-PYTHON_BIN="$BACKEND_VENV_DIR/bin/python"
-ML_PYTHON_BIN="$ML_VENV_DIR/bin/python"
+PYTHON_BIN="$(venv_python_bin "$BACKEND_VENV_DIR" || echo "$BACKEND_VENV_DIR/bin/python")"
+ML_PYTHON_BIN="$(venv_python_bin "$ML_VENV_DIR" || echo "$ML_VENV_DIR/bin/python")"
 
 # ── ML Inference Server ───────────────────────────────────────────────────
 if [ -d "$ML_DIR" ]; then
   echo "[start.sh] ML models directory found at $ML_DIR"
 
-  if [ ! -x "$ML_PYTHON_BIN" ]; then
+  if [ ! -f "$ML_VENV_DIR/Scripts/python.exe" ] && [ ! -f "$ML_VENV_DIR/bin/python" ] && [ ! -f "$ML_VENV_DIR/Scripts/python" ]; then
     echo "[start.sh] Creating ML virtual environment..."
     "$SYSTEM_PYTHON_BIN" -m venv "$ML_VENV_DIR"
   fi
+  ML_PYTHON_BIN="$(venv_python_bin "$ML_VENV_DIR" || echo "$ML_VENV_DIR/bin/python")"
 
   install_ml_dependencies
 
@@ -290,10 +316,11 @@ else
 fi
 
 # ── Backend ────────────────────────────────────────────────────────────────
-if [ ! -x "$PYTHON_BIN" ]; then
+if [ ! -f "$BACKEND_VENV_DIR/Scripts/python.exe" ] && [ ! -f "$BACKEND_VENV_DIR/bin/python" ] && [ ! -f "$BACKEND_VENV_DIR/Scripts/python" ]; then
   echo "[start.sh] Creating Backend virtual environment..."
   "$SYSTEM_PYTHON_BIN" -m venv "$BACKEND_VENV_DIR"
 fi
+PYTHON_BIN="$(venv_python_bin "$BACKEND_VENV_DIR" || echo "$BACKEND_VENV_DIR/bin/python")"
 
 install_backend_dependencies
 

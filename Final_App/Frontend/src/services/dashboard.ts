@@ -5,8 +5,9 @@ import type {
   RevenueTrendsResponse,
 } from "@/types/api";
 
-export function getDashboardSummary(): Promise<DashboardSummary> {
-  return fetchJson<DashboardSummary>("/api/dashboard-summary");
+export function getDashboardSummary(monthId?: string): Promise<DashboardSummary> {
+  const path = monthId ? `/api/dashboard-summary?monthId=${encodeURIComponent(monthId)}` : "/api/dashboard-summary";
+  return fetchJson<DashboardSummary>(path);
 }
 
 export function getMonthlyLogistics(): Promise<MonthlyLogisticsResponse> {

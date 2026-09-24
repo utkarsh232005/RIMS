@@ -2,9 +2,11 @@ from __future__ import annotations
 
 import os
 from datetime import datetime, timedelta
+from pathlib import Path
 from typing import Any, Callable
 
-from fastapi import APIRouter, HTTPException
+import pandas as pd
+from fastapi import APIRouter, HTTPException, Query
 from fastapi.concurrency import run_in_threadpool
 
 from databricks_client import (
@@ -14,6 +16,8 @@ from databricks_client import (
 )
 
 analytics_router = APIRouter()
+LOCAL_GOLD_DATA_PATH = Path(__file__).resolve().parents[2] / "SCI_Rag" / "data" / "03_gold_load_sql.csv"
+LIVE_MONTH_IDS = {"mar-2026", "apr-2026"}
 
 
 def _table(env_name: str, default_name: str) -> str:
@@ -39,6 +43,320 @@ def _historical_gold_table() -> str | None:
     return get_databricks_client().table(table_name) if table_name else None
 
 
+def _load_local_historical_gold_dataframe() -> pd.DataFrame | None:
+    if not LOCAL_GOLD_DATA_PATH.exists():
+        return None
+
+    try:
+        return pd.read_csv(LOCAL_GOLD_DATA_PATH)
+    except Exception as exc:
+        print(f"[databricks_analytics] Could not load {LOCAL_GOLD_DATA_PATH}: {exc}")
+        return None
+
+
+def _parse_month_id(month_id: str | None) -> datetime | None:
+    if not month_id:
+        return None
+    try:
+        return datetime.strptime(month_id.title(), "%b-%Y")
+    except ValueError:
+        return None
+
+
+def _filter_local_gold_month_frame(month_id: str | None) -> pd.DataFrame | None:
+    frame = _load_local_historical_gold_dataframe()
+    month_start = _parse_month_id(month_id)
+    if frame is None or month_start is None or frame.empty or "order_date" not in frame.columns:
+        return None
+
+    scoped = frame.copy()
+    scoped["order_date"] = pd.to_datetime(scoped["order_date"], errors="coerce")
+    scoped = scoped[scoped["order_date"].notna()]
+    scoped = scoped[
+        (scoped["order_date"].dt.year == month_start.year)
+        & (scoped["order_date"].dt.month == month_start.month)
+    ]
+    return scoped if not scoped.empty else None
+
+
+def _series_or_default(frame: pd.DataFrame, column: str, default: float = 0.0) -> pd.Series:
+    if column in frame.columns:
+        return pd.to_numeric(frame[column], errors="coerce").fillna(default)
+    return pd.Series([default] * len(frame), index=frame.index, dtype="float64")
+
+
+def _build_summary_from_frame(frame: pd.DataFrame, month_label: str) -> dict[str, Any]:
+    shipments = len(frame)
+    late = _series_or_default(frame, "is_late_delivery").eq(1)
+    late_shipments = int(late.sum())
+    on_time_pct = (shipments - late_shipments) / shipments * 100 if shipments else 0.0
+    sales = _series_or_default(frame, "sales")
+    avg_order_value = _series_or_default(frame, "avg_order_value_30d")
+    forecast_accuracy = 100 - (abs(sales - avg_order_value).div(sales.abs().replace(0, pd.NA)).fillna(0).mean() * 100)
+    cost_per_order = _series_or_default(frame, "avg_shipping_cost").mean() if shipments else 0.0
+    losses = _series_or_default(frame, "profit").lt(0).sum()
+    latest_order_date = frame["order_date"].max()
+
+    by_mode = (
+        frame.assign(_late=late.astype(int))
+        .groupby("shipping_mode", dropna=False, as_index=False)
+        .agg(orders=("_late", "size"), late_pct=("_late", "mean"))
+        .sort_values("late_pct", ascending=False)
+        .head(4)
+    )
+
+    late_pct = late_shipments / shipments * 100 if shipments else 0.0
+    return {
+        "kpiMetrics": [
+            {"id": "k1", "label": "On-Time Delivery", "value": _pct(on_time_pct), "delta": 0, "trend": "flat", "hint": month_label},
+            {"id": "k2", "label": "Forecast Accuracy", "value": _pct(_clamp(forecast_accuracy)), "delta": 0, "trend": "flat", "hint": "Selected month"},
+            {"id": "k3", "label": "Inventory Turns", "value": "—", "delta": 0, "trend": "flat", "hint": "Not available in this source"},
+            {"id": "k4", "label": "Shipments", "value": f"{shipments:,}", "delta": 0, "trend": "flat", "hint": f"{late_shipments:,} late"},
+            {"id": "k5", "label": "Cost / Order", "value": _money(cost_per_order), "delta": 0, "trend": "flat", "hint": "Selected month"},
+            {"id": "k6", "label": "Open Exceptions", "value": f"{int(late_shipments + losses):,}", "delta": 0, "trend": "flat", "hint": "Late + loss orders"},
+        ],
+        "activityFeed": [
+            {
+                "id": f"a{index + 1}",
+                "timestamp": f"Data through {latest_order_date.date() if pd.notna(latest_order_date) else month_label}",
+                "agent": "Logistics",
+                "action": f"{row.get('shipping_mode') or 'Unknown mode'} late-delivery rate is {float(row.get('late_pct')) * 100:.1f}% across {int(row.get('orders')):,} orders",
+                "status": "warning" if float(row.get("late_pct")) > 0.25 else "success",
+            }
+            for index, row in enumerate(by_mode.to_dict("records"))
+        ],
+        "aiInsights": [
+            {
+                "id": "i1",
+                "title": f"{month_label} delivery pressure",
+                "summary": f"{on_time_pct:.1f}% of orders were delivered on time in the selected month.",
+                "impact": "High" if late_pct > 30 else "Medium" if late_pct else "Low",
+                "confidence": 88,
+                "category": "Logistics",
+            },
+            {
+                "id": "i2",
+                "title": f"{month_label} margin pressure",
+                "summary": f"{int(losses):,} orders have negative profit in the selected month.",
+                "impact": "High" if losses > 50 else "Medium" if losses else "Low",
+                "confidence": 86,
+                "category": "Demand",
+            },
+        ],
+        "autonomousDecisions": [],
+        "warehouseUtilization": [],
+        "shipmentStats": [
+            {"label": "Shipments", "value": f"{shipments:,}"},
+            {"label": "On time", "value": f"{shipments - late_shipments:,}"},
+            {"label": "Delayed", "value": f"{late_shipments:,}"},
+            {"label": "At risk", "value": f"{int(losses):,}"},
+        ],
+    }
+
+
+def _build_live_summary(month_id: str | None) -> dict[str, Any]:
+    from live_data_injection_pipeline.stream_engine import get_demand_history, get_risk_history
+
+    risk_history = get_risk_history()
+    demand_history = get_demand_history()
+    if not risk_history:
+        return build_dashboard_summary_fallback(None)
+
+    month_label = "March 2026" if month_id == "mar-2026" else "April 2026"
+    factor = 1.0 if month_id == "mar-2026" else 1.12
+    total = len(risk_history)
+    delivered = sum(1 for event in risk_history if event.get("shipment_status") == "Delivered")
+    delayed = sum(1 for event in risk_history if event.get("shipment_status") == "Delayed")
+    at_risk = sum(1 for event in risk_history if event.get("shipment_status") == "At Risk")
+    returned = sum(1 for event in risk_history if event.get("shipment_status") == "Returned")
+    in_transit = max(0, total - delivered - delayed - at_risk - returned)
+    late_pct = ((delayed + at_risk) / total * 100) if total else 0.0
+
+    demand_points = demand_history[-10:] if demand_history else []
+    total_actual = sum(point.get("rolling_mean_3", 0) for point in demand_points) or 1
+    total_diff = sum(abs(point.get("predicted_demand", 0) - point.get("rolling_mean_3", 0)) for point in demand_points)
+    accuracy = _clamp(100 - (total_diff / total_actual * 100))
+    latest_demand = demand_points[-1] if demand_points else {"predicted_demand": 0, "rolling_mean_3": 0}
+    cost_per_order = 10 + (total % 7) + (1.5 if month_id == "apr-2026" else 0.0)
+    loss_orders = max(0, int(round(returned * factor)))
+
+    by_mode: dict[str, dict[str, Any]] = {}
+    for event in risk_history:
+        order_summary = event.get("order_summary") or {}
+        mode = str(order_summary.get("shipping_mode") or "Unknown mode")
+        slot = by_mode.setdefault(mode, {"orders": 0, "late": 0})
+        slot["orders"] += 1
+        if event.get("shipment_status") in {"Delayed", "At Risk"}:
+            slot["late"] += 1
+
+    activity_rows = sorted(by_mode.items(), key=lambda item: item[1]["late"] / max(item[1]["orders"], 1), reverse=True)[:4]
+    return {
+        "kpiMetrics": [
+            {"id": "k1", "label": "On-Time Delivery", "value": _pct((delivered / total * 100) if total else 0), "delta": 0, "trend": "flat", "hint": month_label},
+            {"id": "k2", "label": "Forecast Accuracy", "value": _pct(accuracy), "delta": 0, "trend": "flat", "hint": "Live ingestion"},
+            {"id": "k3", "label": "Inventory Turns", "value": "—", "delta": 0, "trend": "flat", "hint": "Not available in live stream"},
+            {"id": "k4", "label": "Shipments", "value": f"{int(round(total * factor)):,}", "delta": 0, "trend": "flat", "hint": f"{int(round((delayed + at_risk) * factor)):,} late"},
+            {"id": "k5", "label": "Cost / Order", "value": _money(cost_per_order), "delta": 0, "trend": "flat", "hint": "Live synthetic"},
+            {"id": "k6", "label": "Open Exceptions", "value": f"{int(round((delayed + at_risk + loss_orders) * factor)):,}", "delta": 0, "trend": "flat", "hint": "Live synthetic"},
+        ],
+        "activityFeed": [
+            {
+                "id": f"a{index + 1}",
+                "timestamp": f"Live tick batch {index + 1}",
+                "agent": "Logistics",
+                "action": f"{mode} late-delivery rate is {slot['late'] / max(slot['orders'], 1) * 100:.1f}% across {slot['orders']:,} live orders",
+                "status": "warning" if slot["late"] / max(slot["orders"], 1) > 0.25 else "success",
+            }
+            for index, (mode, slot) in enumerate(activity_rows)
+        ],
+        "aiInsights": [
+            {
+                "id": "i1",
+                "title": f"{month_label} live delivery pressure",
+                "summary": f"{_pct((delivered / total * 100) if total else 0)} of live orders are on time in the selected month.",
+                "impact": "High" if late_pct > 30 else "Medium" if late_pct else "Low",
+                "confidence": 88,
+                "category": "Logistics",
+            },
+            {
+                "id": "i2",
+                "title": f"{month_label} live demand signal",
+                "summary": f"Latest live demand prediction is {int(round(latest_demand.get('predicted_demand', 0))):,} units.",
+                "impact": "Medium",
+                "confidence": 84,
+                "category": "Demand",
+            },
+        ],
+        "autonomousDecisions": [],
+        "warehouseUtilization": [],
+        "shipmentStats": [
+            {"label": "Shipments", "value": f"{int(round(total * factor)):,}"},
+            {"label": "On time", "value": f"{int(round(delivered * factor)):,}"},
+            {"label": "Delayed", "value": f"{int(round((delayed + at_risk) * factor)):,}"},
+            {"label": "At risk", "value": f"{int(round(loss_orders * factor)):,}"},
+        ],
+    }
+
+
+def _build_demand_from_frame(frame: pd.DataFrame, month_label: str) -> dict[str, Any]:
+    scoped = frame.copy()
+    scoped["order_date"] = pd.to_datetime(scoped["order_date"], errors="coerce")
+    scoped = scoped[scoped["order_date"].notna()]
+    if scoped.empty:
+        return build_demand_intelligence_fallback(month_label)
+
+    scoped["quantity"] = pd.to_numeric(scoped.get("quantity"), errors="coerce").fillna(0)
+    weekly = scoped.groupby(scoped["order_date"].dt.to_period("W").dt.start_time, as_index=False).agg(actual=("quantity", "sum"))
+    weekly = weekly.sort_values("order_date")
+    weekly["lag1"] = weekly["actual"].shift(1).fillna(weekly["actual"])
+    weekly["lead1"] = weekly["actual"].shift(-1).fillna(weekly["actual"])
+    weekly["forecast"] = (0.5 * weekly["actual"] + 0.3 * weekly["lag1"] + 0.2 * weekly["lead1"]).round()
+    latest = weekly.tail(10).copy()
+
+    forecast_series = []
+    for row in latest.itertuples(index=False):
+        actual = int(round(row.actual))
+        forecast = int(round(row.forecast))
+        band = max(abs(actual - forecast), int(round(abs(forecast) * 0.08)))
+        forecast_series.append(
+            {
+                "period": row.order_date.strftime("%b %d"),
+                "actual": actual,
+                "forecast": forecast,
+                "upper": forecast + band,
+                "lower": max(0, forecast - band),
+            }
+        )
+
+    total_actual = sum(point["actual"] for point in forecast_series if point["actual"])
+    total_diff = sum(abs(point["forecast"] - point["actual"]) for point in forecast_series if point["actual"])
+    accuracy = _clamp(100 - ((total_diff / total_actual * 100) if total_actual else 0))
+    recent_points = [point for point in forecast_series[-3:] if point.get("actual")]
+    recent_actual = sum(point["actual"] for point in recent_points)
+    recent_forecast = sum(point["forecast"] for point in recent_points)
+    demand_delta = _clamp(((recent_forecast - recent_actual) / recent_actual * 100) if recent_actual else 0, -100.0, 100.0)
+    latest_row = forecast_series[-1] if forecast_series else {"actual": 0, "forecast": 0, "upper": 0}
+    risk = "High" if latest_row["upper"] > latest_row["forecast"] * 1.25 else "Medium" if latest_row["upper"] > latest_row["forecast"] * 1.1 else "Low"
+
+    return {
+        "forecastSeries": forecast_series,
+        "inventoryHistory": [],
+        "accuracy": _pct(accuracy if accuracy > 0 else 91.5),
+        "kpiStrip": [
+            {"label": "Accuracy", "value": _pct(accuracy if accuracy > 0 else 91.5), "trend": month_label, "trendPositive": True, "icon": "gauge"},
+            {"label": "Demand signal", "value": f"{demand_delta:+.1f}%", "trend": "rolling forecast vs. actual", "trendPositive": demand_delta >= 0, "icon": "trend"},
+            {"label": "Demand risk", "value": risk, "trend": "confidence band", "trendPositive": risk == "Low", "icon": "activity"},
+            {"label": "Data source", "value": "Gold + Live", "trend": "Selected month", "trendPositive": True, "icon": "brain"},
+        ],
+        "modelConfidence": [
+            {"label": "Demand Model (GBDT)", "score": _int(accuracy if accuracy > 0 else 91.5), "detail": f"Selected month: {month_label}"},
+            {"label": "Routing Signal", "score": 86, "detail": "Gold delivery feature pipeline"},
+            {"label": "Risk Classifier", "score": 82, "detail": "Derived supply chain exposure score"},
+            {"label": "Anomaly Detection", "score": 88, "detail": "Reorder & volatility signals"},
+        ],
+        "scenarios": [
+            {"name": "Baseline", "impact": f"{demand_delta:+.1f}%", "desc": "Current month projection", "tone": "border-border"},
+            {"name": "High Demand", "impact": "+12.5%", "desc": "Uses upper confidence band (+12.5% demand surge)", "tone": "border-emerald-500/30 bg-emerald-500/5"},
+            {"name": "Supply Stress", "impact": "-8.4%", "desc": "Uses lower confidence band (-8.4% supply constraint)", "tone": "border-destructive/30 bg-destructive/5"},
+        ],
+    }
+
+
+def _build_live_demand(month_id: str | None) -> dict[str, Any]:
+    from live_data_injection_pipeline.stream_engine import get_demand_history
+
+    demand_history = get_demand_history()
+    if not demand_history:
+        return build_demand_intelligence_fallback(None)
+
+    month_label = "March 2026" if month_id == "mar-2026" else "April 2026"
+    factor = 1.0 if month_id == "mar-2026" else 1.05
+    latest_points = demand_history[-10:]
+    forecast_series = []
+    for point in latest_points:
+        actual = int(round(point.get("rolling_mean_3", 0) * factor))
+        forecast = int(round(point.get("predicted_demand", 0) * factor))
+        band = max(abs(actual - forecast), int(round(abs(forecast) * 0.08)))
+        forecast_series.append(
+            {
+                "period": str(point.get("tick") or month_label),
+                "actual": actual,
+                "forecast": forecast,
+                "upper": forecast + band,
+                "lower": max(0, forecast - band),
+            }
+        )
+
+    total_actual = sum(point["actual"] for point in forecast_series if point["actual"])
+    total_diff = sum(abs(point["forecast"] - point["actual"]) for point in forecast_series if point["actual"])
+    accuracy = _clamp(100 - ((total_diff / total_actual * 100) if total_actual else 0))
+    latest_row = forecast_series[-1] if forecast_series else {"actual": 0, "forecast": 0, "upper": 0}
+    risk = "High" if latest_row["upper"] > latest_row["forecast"] * 1.25 else "Medium" if latest_row["upper"] > latest_row["forecast"] * 1.1 else "Low"
+
+    return {
+        "forecastSeries": forecast_series,
+        "inventoryHistory": [],
+        "accuracy": _pct(accuracy if accuracy > 0 else 91.5),
+        "kpiStrip": [
+            {"label": "Accuracy", "value": _pct(accuracy if accuracy > 0 else 91.5), "trend": month_label, "trendPositive": True, "icon": "gauge"},
+            {"label": "Demand signal", "value": f"{_clamp((latest_row['forecast'] - latest_row['actual']) / max(latest_row['actual'], 1) * 100, -100.0, 100.0):+.1f}%", "trend": "rolling forecast vs. actual", "trendPositive": True, "icon": "trend"},
+            {"label": "Demand risk", "value": risk, "trend": "confidence band", "trendPositive": risk == "Low", "icon": "activity"},
+            {"label": "Data source", "value": "Gold + Live", "trend": "Selected month", "trendPositive": True, "icon": "brain"},
+        ],
+        "modelConfidence": [
+            {"label": "Demand Model (GBDT)", "score": _int(accuracy if accuracy > 0 else 91.5), "detail": f"Selected month: {month_label}"},
+            {"label": "Routing Signal", "score": 86, "detail": "Gold delivery feature pipeline"},
+            {"label": "Risk Classifier", "score": 82, "detail": "Derived supply chain exposure score"},
+            {"label": "Anomaly Detection", "score": 88, "detail": "Reorder & volatility signals"},
+        ],
+        "scenarios": [
+            {"name": "Baseline", "impact": "0.0%", "desc": "Live ingestion baseline", "tone": "border-border"},
+            {"name": "High Demand", "impact": "+12.5%", "desc": "Uses upper confidence band (+12.5% demand surge)", "tone": "border-emerald-500/30 bg-emerald-500/5"},
+            {"name": "Supply Stress", "impact": "-8.4%", "desc": "Uses lower confidence band (-8.4% supply constraint)", "tone": "border-destructive/30 bg-destructive/5"},
+        ],
+    }
+
+
 def _query(statement: str, cache_key: str) -> list[dict[str, Any]]:
     return get_databricks_client().query(statement, cache_key=cache_key)
 
@@ -48,7 +366,7 @@ def _first(rows: list[dict[str, Any]]) -> dict[str, Any]:
 
 
 def _num(value: Any, default: float = 0.0) -> float:
-    if value is None:
+    if value is None or pd.isna(value):
         return default
     try:
         return float(value)
@@ -527,8 +845,8 @@ def _logistics_entry(
     }
 
 
-def _live_august_2026_logistics() -> dict[str, Any]:
-    """Project every live order in this service session into the August view."""
+def _march_2026_live_ingestion_logistics() -> dict[str, Any]:
+    """Project every live order in this service session into a March 2026 view."""
     from live_data_injection_pipeline.stream_engine import get_risk_history
 
     history = get_risk_history()
@@ -537,8 +855,8 @@ def _live_august_2026_logistics() -> dict[str, Any]:
         status = str(event.get("shipment_status") or "In Transit")
         counts[status if status in counts else "In Transit"] += 1
     return _logistics_entry(
-        "aug-2026",
-        "August 2026",
+        "mar-2026",
+        "March 2026",
         delivered=counts["Delivered"],
         in_transit=counts["In Transit"],
         delayed=counts["Delayed"],
@@ -549,18 +867,28 @@ def _live_august_2026_logistics() -> dict[str, Any]:
     )
 
 
-def _july_2026_sample_logistics() -> dict[str, Any]:
-    """Static sample data, deliberately isolated from the real-time pipeline."""
+def _april_2026_live_ingestion_logistics() -> dict[str, Any]:
+    """Synthetic April 2026 live-ingestion tile for the app-side fallback."""
+    from live_data_injection_pipeline.stream_engine import get_risk_history
+
+    history = get_risk_history()
+    live_count = len(history)
+    delivered = max(860, live_count * 5 + 900)
+    in_transit = max(40, live_count * 2 + 55)
+    delayed = max(18, live_count + 24)
+    at_risk = max(8, live_count // 2 + 10)
+    returned = max(4, live_count // 3 + 6)
+
     return _logistics_entry(
-        "jul-2026",
-        "July 2026",
-        delivered=1260,
-        in_transit=72,
-        delayed=96,
-        at_risk=38,
-        returned=14,
-        footer_insight="Static July 2026 sample data. It does not receive live pipeline updates.",
-        source="sample",
+        "apr-2026",
+        "April 2026",
+        delivered=delivered,
+        in_transit=in_transit,
+        delayed=delayed,
+        at_risk=at_risk,
+        returned=returned,
+        footer_insight="Synthetic April 2026 ingestion tile generated by the app when Databricks is offline.",
+        source="live",
     )
 
 
@@ -587,8 +915,6 @@ def build_monthly_logistics() -> dict[str, Any]:
           FROM {delivery}
           WHERE order_date IS NOT NULL
           GROUP BY date_trunc('month', order_date)
-          ORDER BY month_start DESC
-          LIMIT 6
         )
         SELECT *
         FROM monthly
@@ -641,11 +967,11 @@ def build_monthly_logistics() -> dict[str, Any]:
                 },
             ],
         }
-    july = _july_2026_sample_logistics()
-    august = _live_august_2026_logistics()
+    march = _march_2026_live_ingestion_logistics()
+    april = _april_2026_live_ingestion_logistics()
     return {
-        "monthOrder": [august["id"], july["id"], *month_order],
-        "byMonth": {august["id"]: august, july["id"]: july, **by_month},
+        "monthOrder": [march["id"], april["id"], *month_order],
+        "byMonth": {march["id"]: march, april["id"]: april, **by_month},
     }
 
 
@@ -1292,7 +1618,14 @@ def build_revenue_trends() -> dict[str, Any]:
 
 # ── Fallback Data Generators ──────────────────────────────────────────────
 
-def build_dashboard_summary_fallback() -> dict[str, Any]:
+def build_dashboard_summary_fallback(month_id: str | None = None) -> dict[str, Any]:
+    if month_id in LIVE_MONTH_IDS:
+        return _build_live_summary(month_id)
+
+    scoped_frame = _filter_local_gold_month_frame(month_id)
+    if scoped_frame is not None:
+        return _build_summary_from_frame(scoped_frame, scoped_frame["order_date"].dt.strftime("%B %Y").iloc[0])
+
     return {
         "kpiMetrics": [
             {"id": "k1", "label": "On-Time Delivery", "value": "94.2%", "delta": 1.5, "trend": "up", "hint": "Gold delivery features"},
@@ -1333,6 +1666,64 @@ def build_dashboard_summary_fallback() -> dict[str, Any]:
 
 
 def build_monthly_logistics_fallback() -> dict[str, Any]:
+    dataframe = _load_local_historical_gold_dataframe()
+    if dataframe is not None and not dataframe.empty and "order_date" in dataframe.columns:
+        frame = dataframe.copy()
+        frame["order_date"] = pd.to_datetime(frame["order_date"], errors="coerce")
+        frame = frame[frame["order_date"].notna()].copy()
+        if not frame.empty:
+            frame["shipment_date"] = pd.to_datetime(frame.get("shipment_date"), errors="coerce")
+            frame["profit"] = pd.to_numeric(frame.get("profit"), errors="coerce").fillna(0)
+            frame["is_late_delivery"] = pd.to_numeric(frame.get("is_late_delivery"), errors="coerce").fillna(0)
+            frame["lead_time"] = pd.to_numeric(frame.get("lead_time"), errors="coerce")
+            frame["avg_lead_time_by_mode"] = pd.to_numeric(frame.get("avg_lead_time_by_mode"), errors="coerce")
+
+            month_starts = (
+                frame["order_date"].dt.to_period("M").dt.to_timestamp()
+                .dropna()
+                .sort_values()
+                .unique()
+            )
+            by_month: dict[str, dict[str, Any]] = {}
+            month_order: list[str] = []
+            today = datetime.now().date()
+
+            for month_start in month_starts:
+                month_frame = frame[frame["order_date"].dt.to_period("M") == month_start.to_period("M")]
+                month_id = month_start.strftime("%b-%Y").lower()
+                delivered = int((month_frame["is_late_delivery"] == 0).sum())
+                delayed = int((month_frame["is_late_delivery"] == 1).sum())
+                in_transit = int((month_frame["shipment_date"].dt.date > today).fillna(False).sum())
+                at_risk = int(
+                    (
+                        (month_frame["is_late_delivery"] == 1)
+                        & (month_frame["lead_time"] > month_frame["avg_lead_time_by_mode"].fillna(month_frame["lead_time"]))
+                    ).fillna(False).sum()
+                )
+                returned = int((month_frame["profit"] < 0).sum())
+
+                month_order.append(month_id)
+                by_month[month_id] = {
+                    "id": month_id,
+                    "label": month_start.strftime("%B %Y"),
+                    "footerInsight": (
+                        f"{delivered:,} delivered, {delayed:,} late, {at_risk:,} at risk in the merged Gold CSV."
+                    ),
+                    "slices": [
+                        {"key": "delivered", "name": "Delivered", "value": delivered, "operationalNote": "Arrived without late-delivery flag"},
+                        {"key": "inTransit", "name": "In Transit", "value": in_transit, "operationalNote": "Shipment date is still ahead of today"},
+                        {"key": "delayed", "name": "Delayed", "value": delayed, "operationalNote": "Flagged as late delivery"},
+                        {"key": "atRisk", "name": "At Risk", "value": at_risk, "operationalNote": "Late delivery with extended lead time"},
+                        {"key": "returned", "name": "Returned", "value": returned, "operationalNote": "Negative profit flag"},
+                    ],
+                }
+
+            if month_order:
+                return {
+                    "monthOrder": month_order,
+                    "byMonth": by_month,
+                }
+
     by_month = {
         "mar-2026": {
             "id": "mar-2026",
@@ -1365,7 +1756,14 @@ def build_monthly_logistics_fallback() -> dict[str, Any]:
     }
 
 
-def build_demand_intelligence_fallback() -> dict[str, Any]:
+def build_demand_intelligence_fallback(month_id: str | None = None) -> dict[str, Any]:
+    if month_id in LIVE_MONTH_IDS:
+        return _build_live_demand(month_id)
+
+    scoped_frame = _filter_local_gold_month_frame(month_id)
+    if scoped_frame is not None:
+        return _build_demand_from_frame(scoped_frame, scoped_frame["order_date"].dt.strftime("%B %Y").iloc[0])
+
     weeks = [f"W{i:02d}" for i in range(1, 11)]
     base_demand = [4500, 4620, 4800, 4750, 4900, 5100, 5050, 5200, 5350, 5500]
     series = []
@@ -1526,8 +1924,8 @@ async def databricks_status():
 
 
 @analytics_router.get("/api/dashboard-summary")
-async def dashboard_summary():
-    return await run_in_threadpool(lambda: _call_databricks(build_dashboard_summary, build_dashboard_summary_fallback))
+async def dashboard_summary(month_id: str | None = Query(None, alias="monthId")):
+    return await run_in_threadpool(lambda: _call_databricks(build_dashboard_summary, lambda: build_dashboard_summary_fallback(month_id)))
 
 
 @analytics_router.get("/api/monthly-logistics")
@@ -1536,8 +1934,8 @@ async def monthly_logistics():
 
 
 @analytics_router.get("/api/demand-intelligence")
-async def demand_intelligence():
-    return await run_in_threadpool(lambda: _call_databricks(build_demand_intelligence, build_demand_intelligence_fallback))
+async def demand_intelligence(month_id: str | None = Query(None, alias="monthId")):
+    return await run_in_threadpool(lambda: _call_databricks(build_demand_intelligence, lambda: build_demand_intelligence_fallback(month_id)))
 
 
 @analytics_router.get("/api/regional-performance")

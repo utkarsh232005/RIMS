@@ -1,5 +1,6 @@
 import { createFileRoute } from "@tanstack/react-router";
 import { useQuery } from "@tanstack/react-query";
+import { useState } from "react";
 import { Download } from "lucide-react";
 import { PageHeader } from "@/components/layout/page-header";
 import { KpiGrid } from "@/components/dashboard/operations/kpi-grid";
@@ -26,9 +27,11 @@ export const Route = createFileRoute("/")({
 });
 
 function Overview() {
+  const [selectedMonthId, setSelectedMonthId] = useState<string>("");
+
   const { data, isLoading, error, refetch } = useQuery({
-    queryKey: ["dashboard-summary"],
-    queryFn: getDashboardSummary,
+    queryKey: ["dashboard-summary", selectedMonthId || "all"],
+    queryFn: () => getDashboardSummary(selectedMonthId || undefined),
     staleTime: 60_000,
   });
   const overviewKpiMetrics = (data?.kpiMetrics ?? []).filter((m) =>
@@ -70,7 +73,7 @@ function Overview() {
               <KpiGrid metrics={overviewKpiMetrics} className="h-full w-full" />
             </div>
             <div className="min-w-0">
-              <MonthlyLogisticsPie className="h-full w-full" />
+              <MonthlyLogisticsPie className="h-full w-full" onMonthChange={setSelectedMonthId} />
             </div>
           </div>
         )}
@@ -83,7 +86,7 @@ function Overview() {
         >
           Forecast
         </h2>
-        <ForecastChart height={400} />
+        <ForecastChart height={400} monthId={selectedMonthId || undefined} />
       </section>
 
       <section className="space-y-3" aria-labelledby="overview-insights-heading">

@@ -26,6 +26,7 @@ import {
 } from "@/services/pipeline";
 
 const CRITICAL_INVENTORY_THRESHOLD = 5400;
+const LIVE_MONTH_IDS = new Set(["mar-2026", "apr-2026"]);
 
 type ChartView = "actual" | "forecast" | "confidence" | "combined";
 
@@ -132,7 +133,7 @@ function ForecastTooltip({
 
 const MAX_LIVE_POINTS = 20;
 
-export function ForecastChart({ height = 360 }: { height?: number }) {
+export function ForecastChart({ height = 360, monthId }: { height?: number; monthId?: string }) {
   const uid = useId().replace(/:/g, "");
   const gradId = `df-confidence-${uid}`;
   const [view, setView] = useState<ChartView>("combined");
@@ -178,14 +179,17 @@ export function ForecastChart({ height = 360 }: { height?: number }) {
     error,
     refetch,
   } = useQuery({
-    queryKey: ["demand-intelligence"],
-    queryFn: getDemandIntelligence,
+    queryKey: ["demand-intelligence", monthId ?? "all"],
+    queryFn: () => getDemandIntelligence(monthId),
     staleTime: 60_000,
   });
 
+  const showLiveOverlay = monthId ? LIVE_MONTH_IDS.has(monthId) : true;
+  const displayLivePoints = showLiveOverlay ? livePoints : [];
+
   const data = useMemo(
-    () => enrichData(demand?.forecastSeries ?? [], livePoints),
-    [demand?.forecastSeries, livePoints, tickCount]
+    () => enrichData(demand?.forecastSeries ?? [], displayLivePoints),
+    [demand?.forecastSeries, displayLivePoints, tickCount]
   );
 
   const showConfidence = view === "confidence" || view === "combined";
@@ -196,7 +200,7 @@ export function ForecastChart({ height = 360 }: { height?: number }) {
   if (error) return <ErrorBlock error={error} onRetry={() => refetch()} />;
   if (!data.length || !demand) return <EmptyBlock />;
 
-  const latestLive = livePoints.length > 0 ? livePoints[livePoints.length - 1] : null;
+  const latestLive = displayLivePoints.length > 0 ? displayLivePoints[displayLivePoints.length - 1] : null;
 
   return (
     <section className={cn("rounded-md border border-border/70 bg-surface p-5 sm:p-6 space-y-5")}>
@@ -205,7 +209,7 @@ export function ForecastChart({ height = 360 }: { height?: number }) {
         <div className="min-w-0 space-y-1">
           <h3 className="text-base font-semibold tracking-tight text-foreground sm:text-lg flex items-center gap-2">
             Demand Forecast
-            {livePoints.length > 0 && (
+            {displayLivePoints.length > 0 && (
               <span className="inline-flex items-center gap-1.5 rounded-full bg-emerald-500/10 px-2.5 py-0.5 text-xs font-semibold text-emerald-600 dark:text-emerald-400 border border-emerald-500/20">
                 <Radio className="h-3 w-3 animate-pulse" /> Live Pipeline Active
               </span>
