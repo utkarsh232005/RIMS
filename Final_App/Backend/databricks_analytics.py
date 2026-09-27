@@ -57,10 +57,25 @@ def _load_local_historical_gold_dataframe() -> pd.DataFrame | None:
 def _parse_month_id(month_id: str | None) -> datetime | None:
     if not month_id:
         return None
-    try:
-        return datetime.strptime(month_id.title(), "%b-%Y")
-    except ValueError:
+
+    candidate = str(month_id).strip().lower().replace("/", "-").replace("_", "-")
+    if not candidate:
         return None
+
+    patterns = ["%b-%Y", "%B-%Y", "%b %Y", "%B %Y", "%Y-%m", "%Y/%m"]
+    for fmt in patterns:
+        try:
+            return datetime.strptime(candidate, fmt)
+        except ValueError:
+            pass
+
+    for fmt in ["%b-%Y", "%B-%Y"]:
+        try:
+            return datetime.strptime(candidate.title(), fmt)
+        except ValueError:
+            pass
+
+    return None
 
 
 def _filter_local_gold_month_frame(month_id: str | None) -> pd.DataFrame | None:
@@ -803,7 +818,11 @@ def build_shipment_stats() -> list[dict[str, Any]]:
     ]
 
 
-def build_dashboard_summary() -> dict[str, Any]:
+def build_dashboard_summary(month_id: str | None = None) -> dict[str, Any]:
+    frame = _filter_local_gold_month_frame(month_id)
+    if frame is not None:
+        return _build_summary_from_frame(frame, frame["order_date"].dt.strftime("%B %Y").iloc[0])
+
     historical = _historical_gold_table()
     if historical:
         return _build_historical_dashboard_summary(historical)
@@ -1055,7 +1074,11 @@ def _build_historical_demand_intelligence(table: str) -> dict[str, Any]:
     }
 
 
-def build_demand_intelligence() -> dict[str, Any]:
+def build_demand_intelligence(month_id: str | None = None) -> dict[str, Any]:
+    frame = _filter_local_gold_month_frame(month_id)
+    if frame is not None:
+        return _build_demand_from_frame(frame, frame["order_date"].dt.strftime("%B %Y").iloc[0])
+
     historical = _historical_gold_table()
     if historical:
         return _build_historical_demand_intelligence(historical)
@@ -1925,7 +1948,7 @@ async def databricks_status():
 
 @analytics_router.get("/api/dashboard-summary")
 async def dashboard_summary(month_id: str | None = Query(None, alias="monthId")):
-    return await run_in_threadpool(lambda: _call_databricks(build_dashboard_summary, lambda: build_dashboard_summary_fallback(month_id)))
+    return await run_in_threadpool(lambda: _call_databricks(lambda: build_dashboard_summary(month_id), lambda: build_dashboard_summary_fallback(month_id)))
 
 
 @analytics_router.get("/api/monthly-logistics")
@@ -1935,7 +1958,7 @@ async def monthly_logistics():
 
 @analytics_router.get("/api/demand-intelligence")
 async def demand_intelligence(month_id: str | None = Query(None, alias="monthId")):
-    return await run_in_threadpool(lambda: _call_databricks(build_demand_intelligence, lambda: build_demand_intelligence_fallback(month_id)))
+    return await run_in_threadpool(lambda: _call_databricks(lambda: build_demand_intelligence(month_id), lambda: build_demand_intelligence_fallback(month_id)))
 
 
 @analytics_router.get("/api/regional-performance")
